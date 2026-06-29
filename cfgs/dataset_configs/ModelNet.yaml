@@ -1,0 +1,9 @@
+NAME: CRNShapeNet
+DATA_PATH: data/our_data #virtual dataset
+N_POINTS: 2048
+#CLASS_CHOICE: lamp
+CLASS_CHOICE: chair
+#CLASS_CHOICE: car
+#CLASS_CHOICE: plane
+#CLASS_CHOICE: sofa
+SPLIT: train
