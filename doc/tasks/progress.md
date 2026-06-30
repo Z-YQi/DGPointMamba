@@ -7,7 +7,7 @@
 ## 总体进度
 
 - [ ] `dg-training-runner.md` - Fixed SinPoint 双分支 DG 训练入口。
-- [ ] `backbone-cleanup.md` - 清理 UDA 双输入对齐骨架，统一单输入补全 backbone。
+- [x] `backbone-cleanup.md` - 清理 UDA 双输入对齐骨架，统一单输入补全 backbone。
 - [ ] `fixed-sinpoint-baseline.md` - 第一条正式 Fixed SinPoint baseline。
 - [ ] `learnable-global-sinpoint.md` - 可学习全局 SinPoint baseline。
 - [ ] `learnable-msf-generator.md` - 可学习 multi-anchor sine field 伪域生成器。

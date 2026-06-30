@@ -1,12 +1,12 @@
 """
 Test script for SinPoint augmentation visualization.
 
-This script loads data from DAPointMamba's Source Dataloader, applies SinPoint augmentation,
+This script loads data from DGPointMamba's source dataloader, applies SinPoint augmentation,
 and saves both original and augmented point clouds as PLY files for visual comparison.
 
 Usage:
     python test_augmentation_vis.py
-    python test_augmentation_vis.py --config cfgs/ModelNet_models/DAPointMamba.yaml --batch_size 8
+    python test_augmentation_vis.py --config cfgs/ModelNet_models/DGPointMamba.yaml --batch_size 8
 """
 
 import torch
@@ -82,7 +82,7 @@ def main():
     # 1. Parse command line arguments
     parser = argparse.ArgumentParser(description='Test SinPoint Augmentation Visualization')
     parser.add_argument('--config', type=str, 
-                       default='cfgs/ModelNet_models/DAPointMamba.yaml',
+                       default='cfgs/ModelNet_models/DGPointMamba.yaml',
                        help='Config file path')
     parser.add_argument('--output_dir', type=str, 
                        default='augmentation_visualization',

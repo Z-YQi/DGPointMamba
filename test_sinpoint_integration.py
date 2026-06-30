@@ -1,5 +1,5 @@
 """
-Test script to verify SinPoint integration into DAPointMamba project.
+Test script to verify SinPoint integration into the DGPointMamba project.
 """
 
 import torch

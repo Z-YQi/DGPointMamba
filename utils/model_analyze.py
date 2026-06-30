@@ -7,13 +7,13 @@ from easydict import EasyDict
 import sys
 
 sys.path.append('.')
-from models.point_mamba import DAMamba
+from models.point_mamba import DGPointMamba
 
 def get_model(config_path, device):
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
     config = EasyDict(config_dict)
-    model = DAMamba(config.model).to(device)
+    model = DGPointMamba(config.model).to(device)
     model.eval()
     return model
 

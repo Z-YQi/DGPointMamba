@@ -15,7 +15,93 @@ from utils.metrics import Metrics
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2,UnidirectionalChamferDistance,DirectedHausdorffDistance
 from utils import loss_util
 from utils.AverageMeter import AverageMeter
-from utils.sinpoint_augmentation import SinPoint
+from utils.domain_generators import build_domain_generator
+from utils.experiment_logging import ExperimentLogger, metric_dict
+
+
+DG_METRIC_NAMES = ['F-Score', 'CDL1', 'CDL2', 'EMDistance', 'UCD', 'UHD']
+
+
+def _ensure_point_cloud_batch(points, name):
+    if points.dim() == 4 and points.size(0) == 1:
+        points = points.squeeze(0)
+    if points.dim() != 3 or points.size(-1) != 3:
+        raise ValueError(f"{name} must have shape [B, N, 3], got {tuple(points.shape)}")
+    return points.float().contiguous()
+
+
+def _move_to_device(tensor, args):
+    tensor = tensor.float()
+    if args.use_gpu:
+        tensor = tensor.cuda(non_blocking=True)
+    return tensor
+
+
+def _model_rebuild_points(model_output):
+    if isinstance(model_output, tuple):
+        return model_output[0]
+    return model_output
+
+
+def _scalar_item(value):
+    if torch.is_tensor(value):
+        return float(value.detach().item())
+    return float(value)
+
+
+def _format_generator_stats(stats):
+    return (
+        f"A={stats['sinpoint_A']:.4f}, w={stats['sinpoint_w']:.4f}, "
+        f"rand_center_num={stats['sinpoint_rand_center_num']}, sample={stats['sinpoint_sample']}, "
+        f"mean_delta_p={stats['mean_delta_p']:.6f}, max_delta_p={stats['max_delta_p']:.6f}"
+    )
+
+
+def _loss_weight(config, key, default):
+    loss_weights = config.get("loss_weights", None)
+    if loss_weights is None:
+        return default
+    return float(loss_weights.get(key, default))
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _format_metric_header(metric_names):
+    metric_names = list(metric_names)
+    if metric_names != DG_METRIC_NAMES:
+        raise ValueError(f"Metric order mismatch: expected {DG_METRIC_NAMES}, got {metric_names}")
+    return ' | '.join(metric_names)
+
+
+def _format_metric_values(metric_values):
+    return ' | '.join('%.6f' % float(value) for value in metric_values)
+
+
+def _visualization_output_dir(args, config):
+    logging_config = _cfg_get(config, "logging", None)
+    visualization_dir = _cfg_get(logging_config, "visualization_dir", "point_visualization")
+    if os.path.isabs(visualization_dir):
+        return visualization_dir
+    return os.path.join(getattr(args, "experiment_path", "."), visualization_dir)
+
+
+def _write_test_experiment_summary(experiment_logger, args, metrics_state):
+    if experiment_logger is None:
+        return
+    checkpoint_path = getattr(args, "ckpts", "") or ""
+    experiment_logger.log_metrics({
+        'event': 'test',
+        **metrics_state,
+    })
+    experiment_logger.update_best('', metrics_state, checkpoint_path)
+    experiment_logger.write_summary(status='completed', metrics=metrics_state, checkpoint_path=checkpoint_path)
+    experiment_logger.write_run_meta(status='completed')
 
 
 
@@ -27,15 +113,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
     UCD_distance = UnidirectionalChamferDistance()
     UHD_distance = DirectedHausdorffDistance()
     completion_loss = loss_util.Completionloss(loss_func=config.consider_metric)
-    # build dataset CRN train and CRN test dataset
-    train_sampler, train_dataloader = builder.virtual_dataset_builder(args,  config.dataset.train)  #CRN训练集 Chair 79
-    config.dataset.test._base_.SPLIT= 'test'
-    _, test_dataloader = builder.virtual_dataset_builder(args,config.dataset.test) #CRN测试集
-    # build real data
-    config.dataset.train._base_.SPLIT = 'train'
-    _,real_train_dataloader = builder.real_dataset_builder(args, config.dataset.train) #3D FUTURE训练
+    # Source-only DG training: use CRN/ShapeNet train data only.
+    train_sampler, train_dataloader = builder.virtual_dataset_builder(args, config.dataset.train)
     config.dataset.test._base_.SPLIT = 'test'
-    real_test_sampler, real_test_dataloader = builder.real_dataset_builder(args,config.dataset.test) #3D FUTURE测试集
+    _, real_test_dataloader = builder.real_dataset_builder(args, config.dataset.test)
 
     # build model
     base_model = builder.model_builder(config.model)
@@ -73,18 +154,18 @@ def run_net(args, config, train_writer=None, val_writer=None):
     if args.resume:
         builder.resume_optimizer(optimizer, args, logger=logger)
 
-    # Initialize SinPoint augmentation for DG
-    class SinPointArgs:
-        def __init__(self):
-            self.A = 0.8              # Amplitude parameter
-            self.w = 3.0              # Frequency parameter
-            self.rand_center_num = 4  # Random center point count
-            self.sample = "RPS"       # Sampling method
-            self.isCat = False        # Don't concatenate original data
-            self.shuffle = False      # Don't shuffle
-    
-    sinpoint_aug = SinPoint(SinPointArgs())
-    print_log('SinPoint augmentation initialized for DG transformation', logger=logger)
+    domain_generator = build_domain_generator(config)
+    if domain_generator is None:
+        raise ValueError("Fixed SinPoint baseline requires domain_generator.type: fixed_sinpoint")
+    lambda_aug = _loss_weight(config, "aug", 1.0)
+    generator_device = next(base_model.parameters()).device
+    init_num_points = max(getattr(domain_generator, "rand_center_num", 4), 4)
+    _, init_generator_stats = domain_generator(torch.randn(1, init_num_points, 3, device=generator_device))
+    print_log(f'[DGPointMamba] Domain generator initialized: fixed_sinpoint ({_format_generator_stats(init_generator_stats)})', logger=logger)
+    print_log(f'[DGPointMamba] Training loss: loss_rec_clean + {lambda_aug:.4f} * loss_rec_aug_src', logger=logger)
+    experiment_logger = ExperimentLogger(args, config)
+    experiment_logger.write_run_meta(status='running')
+    experiment_logger.write_summary(status='running')
 
     # training
     base_model.zero_grad()
@@ -97,90 +178,49 @@ def run_net(args, config, train_writer=None, val_writer=None):
         batch_start_time = time.time()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        avg_meter_loss = AverageMeter(['loss_partial', 'loss_pc', 'loss_p1', 'loss_p2', 'loss_p3'])
+        avg_meter_loss = AverageMeter(['loss_total', 'loss_rec_clean', 'loss_rec_aug_src'])
         num_iter = 0
         base_model.train()  # set model to training mode
         n_batches = len(train_dataloader)
-        train_dataloader_iter = iter(train_dataloader) #CRN
-        real_train_dataloader_iter = iter(real_train_dataloader)    #3D FUTURE
-        len_train_dataloader = len(train_dataloader)
-        len_real_train_dataloader = len(real_train_dataloader)
-        max_len = max(len_train_dataloader, len_real_train_dataloader)
-        for idx in range(max_len):
-            #load source data
-            try:
-                source_data = next(train_dataloader_iter)
-            except StopIteration:
-                train_dataloader_iter =iter(train_dataloader)
-                source_data = next(train_dataloader_iter)
-            #load target data
-            try:
-                target_data = next(real_train_dataloader_iter)
-            except StopIteration:
-                real_train_dataloader_iter = iter(real_train_dataloader) 
-                target_data = next(real_train_dataloader_iter)
+        source_dataset_name = config.dataset.train._base_.NAME
+        target_dataset_name = config.dataset.train.real_dataset
+        if source_dataset_name != 'CRNShapeNet':
+            raise NotImplementedError(f'Train phase does not support source dataset {source_dataset_name}')
 
+        for idx, source_data in enumerate(train_dataloader):
             data_time.update(time.time() - batch_start_time)
             num_iter += 1
             n_itr = epoch * n_batches + idx
 
-            data_time.update(time.time() - batch_start_time)
-            npoints = config.dataset.train._base_.N_POINTS
-            source_dataset_name = config.dataset.train._base_.NAME
-            target_dataset_name = config.dataset.train.real_dataset
+            source_gt, source_partial, _ = source_data
+            source_gt = _ensure_point_cloud_batch(_move_to_device(source_gt, args), "Y_s")
+            source_partial = _ensure_point_cloud_batch(_move_to_device(source_partial, args), "P_s")
 
-            if source_dataset_name == 'CRNShapeNet' and target_dataset_name in ['3D_FUTURE','ModelNet']:
-                source_gt, source_partial, source_index = source_data
-                target_gt, target_partial, _ = target_data
-            
-            elif source_dataset_name == 'CRNShapeNet' and target_dataset_name in ['MatterPort', 'ScanNet','KITTI']:
-                source_gt, source_partial, source_index = source_data
-                target_partial, _ = target_data
-            
-            else:
-                raise NotImplementedError(f'Train phase do not support {source_dataset_name}')
+            if target_dataset_name in ['3D_FUTURE', 'ModelNet'] and config.dataset.train._base_.CLASS_CHOICE in ['lamp', 'table']:
+                source_partial, _, _, _ = partial_render_batch(source_gt, source_partial)
+                source_partial = _ensure_point_cloud_batch(source_partial, "P_s")
 
+            aug_partial, generator_stats = domain_generator(source_partial)
+            assert aug_partial.device == source_partial.device, "P_aug.device must match P_s.device"
+            assert aug_partial.shape == source_partial.shape, f"P_aug.shape must match P_s.shape: {aug_partial.shape} vs {source_partial.shape}"
+            if not generator_stats.get("stats_finite", False):
+                raise FloatingPointError(f"Fixed SinPoint produced non-finite stats: {generator_stats}")
 
-            if source_dataset_name == 'CRNShapeNet' and target_dataset_name in ['3D_FUTURE','ModelNet']:
-                source_gt = source_gt.squeeze(0).cuda()
-                source_partial = source_partial.squeeze(0).cuda()
-                if config.dataset.train._base_.CLASS_CHOICE in ['lamp','table']: 
-                       source_partial, _, _, _ = partial_render_batch(source_gt, source_partial) 
-                
-                # DG transformation: Use augmented source data to replace target domain
-                aug_partial, _ = sinpoint_aug.Sin(source_partial)
-                target_partial = aug_partial  # Directly overwrite target domain
-                
-                # Safety check: Ensure device and shape consistency
-                assert target_partial.device == source_partial.device, "Device mismatch"
-                assert target_partial.shape == source_partial.shape, f"Shape mismatch: {target_partial.shape} vs {source_partial.shape}"
-                
-                rebuild_points, loss_sp, loss_ch= base_model(source_partial, target_partial)        
-                loss_total, losses = completion_loss.get_loss(rebuild_points, source_partial, source_gt)
+            pred_clean = _model_rebuild_points(base_model(source_partial))
+            loss_rec_clean, _ = completion_loss.get_loss(pred_clean, source_partial, source_gt)
 
-                loss_total = loss_total  +  0.1 * loss_sp + 0.1 * loss_ch 
-            elif source_dataset_name == 'CRNShapeNet' and target_dataset_name in ['KITTI','MatterPort','ScanNet']:
+            pred_aug = _model_rebuild_points(base_model(aug_partial))
+            loss_rec_aug_src, _ = completion_loss.get_loss(
+                pred_aug,
+                None,
+                source_gt,
+                include_partial_matching=False,
+            )
 
-                source_gt = source_gt.cuda() 
-                source_partial = source_partial.squeeze().cuda() 
-                
-                # DG transformation: Use augmented source data to replace target domain
-                aug_partial, _ = sinpoint_aug.Sin(source_partial)
-                target_partial = aug_partial  # Directly overwrite target domain
-                
-                # Safety check: Ensure device and shape consistency
-                assert target_partial.device == source_partial.device, "Device mismatch"
-                assert target_partial.shape == source_partial.shape, f"Shape mismatch: {target_partial.shape} vs {source_partial.shape}"
-                
-                rebuild_points, loss_sp, loss_ch= base_model(source_partial, target_partial)        
-                loss_total, losses = completion_loss.get_loss(rebuild_points, source_partial, source_gt)
-
-                loss_total = loss_total +  0.1 * loss_sp + 0.1 * loss_ch 
-            try:
-                loss_total.backward()
-            except:
+            loss_total = loss_rec_clean + lambda_aug * loss_rec_aug_src
+            if loss_total.dim() != 0:
                 loss_total = loss_total.mean()
-                loss_total.backward()
+            loss_total.backward()
 
             # forward
             if num_iter == config.step_per_update:
@@ -189,10 +229,33 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 base_model.zero_grad()
 
             if args.distributed:
-                loss = dist_utils.reduce_tensor(loss, args)
-                losses.update([loss.item() * 10000])
+                loss_total_log = _scalar_item(dist_utils.reduce_tensor(loss_total.detach(), args))
+                loss_rec_clean_log = _scalar_item(dist_utils.reduce_tensor(loss_rec_clean.detach(), args))
+                loss_rec_aug_log = _scalar_item(dist_utils.reduce_tensor(loss_rec_aug_src.detach(), args))
             else:
-                avg_meter_loss.update(losses)
+                loss_total_log = _scalar_item(loss_total)
+                loss_rec_clean_log = _scalar_item(loss_rec_clean)
+                loss_rec_aug_log = _scalar_item(loss_rec_aug_src)
+            avg_meter_loss.update([loss_total_log, loss_rec_clean_log, loss_rec_aug_log])
+
+            if train_writer is not None and args.local_rank == 0:
+                train_writer.add_scalar('DGPointMamba/Train/loss_total', loss_total_log, n_itr)
+                train_writer.add_scalar('DGPointMamba/Train/loss_rec_clean', loss_rec_clean_log, n_itr)
+                train_writer.add_scalar('DGPointMamba/Train/loss_rec_aug_src', loss_rec_aug_log, n_itr)
+                train_writer.add_scalar('DGPointMamba/Generator/FixedSinPoint/mean_delta_p', generator_stats['mean_delta_p'], n_itr)
+                train_writer.add_scalar('DGPointMamba/Generator/FixedSinPoint/max_delta_p', generator_stats['max_delta_p'], n_itr)
+
+            if args.local_rank == 0:
+                experiment_logger.log_metrics({
+                    'event': 'train_step',
+                    'epoch': epoch,
+                    'step': n_itr,
+                    'batch': idx,
+                    'loss_total': loss_total_log,
+                    'loss_rec_clean': loss_rec_clean_log,
+                    'loss_rec_aug_src': loss_rec_aug_log,
+                    **generator_stats,
+                })
                 
 
             if args.distributed:
@@ -203,10 +266,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
             if idx % 20 == 0:
 
-                print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Losses = %s lr = %.6f | loss_total = %.6f | loss_sp = %.6f|loss_ch = %.6f' %
-                        (epoch, config.max_epoch, idx + 1, max_len, batch_time.val(), data_time.val(),
-                        ['%.4f' % l for l in losses], optimizer.param_groups[0]['lr'], loss_total.item(),
-                        loss_sp.item(), loss_ch.item()), logger=logger)
+                print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Losses = %s lr = %.6f | loss_total = %.6f | loss_rec_clean = %.6f | loss_rec_aug_src = %.6f | generator = %s' %
+                        (epoch, config.max_epoch, idx + 1, n_batches, batch_time.val(), data_time.val(),
+                        ['%.4f' % l for l in avg_meter_loss.val()], optimizer.param_groups[0]['lr'], loss_total_log,
+                        loss_rec_clean_log, loss_rec_aug_log, _format_generator_stats(generator_stats)), logger=logger)
         if isinstance(scheduler, list):
             for item in scheduler:
                 item.step(epoch)
@@ -216,20 +279,40 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
 
         print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s lr = %.6f' %
-                  (epoch, epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses],
+                  (epoch, epoch_end_time - epoch_start_time, ['%.4f' % l for l in avg_meter_loss.avg()],
                    optimizer.param_groups[0]['lr']), logger=logger)
 
         if epoch % args.val_freq == 0:
              # Validate the current model
             metrics = validate(base_model, real_test_dataloader, epoch, 
                                     ChamferDisL1, ChamferDisL2, UCD_distance, UHD_distance, val_writer, args, config, logger=logger)
+            metrics_state = metrics.state_dict()
+            if args.local_rank == 0:
+                experiment_logger.log_metrics({
+                    'event': 'validation',
+                    'epoch': epoch,
+                    **metrics_state,
+                })
         
              # Save ckeckpoints
-            if  metrics.better_than(best_metrics):
+            is_best = metrics.better_than(best_metrics)
+            if is_best:
                     best_metrics = metrics
-                    builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt_source_best', args, logger = logger)
+                    builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt_dg_best', args, logger = logger)
+                    if args.local_rank == 0:
+                        experiment_logger.update_best(
+                            epoch,
+                            metrics_state,
+                            os.path.join(args.experiment_path, 'ckpt_dg_best.pth'),
+                        )
+            if args.local_rank == 0:
+                experiment_logger.write_summary(status='running')
+                experiment_logger.write_run_meta(status='running')
         builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
 
+    if args.local_rank == 0:
+        experiment_logger.write_summary(status='completed')
+        experiment_logger.write_run_meta(status='completed')
 
     if train_writer is not None:
         train_writer.close()
@@ -243,6 +326,7 @@ def validate(base_model,real_test_dataloader, epoch, ChamferDisL1, ChamferDisL2,
     test_metrics = AverageMeter(Metrics.names())
     category_metrics = dict()
     n_samples = len(real_test_dataloader) # bs is 1
+    visualization_dir = _visualization_output_dir(args, config)
 
     interval =  n_samples // 10
     source_dataset_name = config.dataset.train._base_.NAME 
@@ -256,14 +340,14 @@ def validate(base_model,real_test_dataloader, epoch, ChamferDisL1, ChamferDisL2,
                     target_partial = target_partial.cuda()
                     target_gt = target_gt.cuda()
 
-                rebuild_points,_,_= base_model(target_partial)
+                rebuild_points = _model_rebuild_points(base_model(target_partial))
 
                 rebuild_points = rebuild_points[-1]
                 
                 if idx <10:
-                    visualize_point_cloud_batch(rebuild_points, f"pred_point_{idx}")
-                    visualize_point_cloud_batch(target_gt, f"gt_{idx}")
-                    visualize_point_cloud_batch(target_partial, f"partial_{idx}")
+                    visualize_point_cloud_batch(rebuild_points, f"pred_point_{idx}", visualization_dir)
+                    visualize_point_cloud_batch(target_gt, f"gt_{idx}", visualization_dir)
+                    visualize_point_cloud_batch(target_partial, f"partial_{idx}", visualization_dir)
                 
                 
                 rebuild_loss_l1 =  ChamferDisL1(rebuild_points, target_gt)
@@ -293,7 +377,7 @@ def validate(base_model,real_test_dataloader, epoch, ChamferDisL1, ChamferDisL2,
                    
 
                 # Calculate losses for target
-                rebuild_points,_,_= base_model(target_partial)#[1, 2048,3]
+                rebuild_points = _model_rebuild_points(base_model(target_partial))#[1, 2048,3]
                 rebuild_dense_points = rebuild_points[-1]
                 uhd_rebuild_loss =  UHD_distance(target_partial.permute([0,2,1]),rebuild_dense_points.permute([0,2,1]))
                 ucd_rebuild_loss =  UCD_distance(target_partial, rebuild_dense_points)
@@ -324,27 +408,18 @@ def validate(base_model,real_test_dataloader, epoch, ChamferDisL1, ChamferDisL2,
     
     # Print testing results
     print_log('============================ TEST RESULTS ============================', logger=logger)
-    msg = '\t\t'
-    
-    for metric in test_metrics.items:
-        msg += metric + '\t'
-    print_log(msg, logger=logger)
-
-    msg=''
-    msg += 'Overall\t'
-    for value in test_metrics.avg():
-        msg += '%.6f \t' % value
-    print_log(msg, logger=logger)
+    print_log(_format_metric_header(test_metrics.items), logger=logger)
+    print_log('Overall | ' + _format_metric_values(test_metrics.avg()), logger=logger)
 
     # Add testing results to TensorBoard
     """
     """
     if val_writer is not None:
-        val_writer.add_scalar('Loss/Epoch/Sparse_L1', test_losses.avg(0), epoch)
-        val_writer.add_scalar('Loss/Epoch/Sparse_L2', test_losses.avg(1), epoch)
+        val_writer.add_scalar('DGPointMamba/Val/Rebuild_Loss_L1', test_losses.avg(0), epoch)
+        val_writer.add_scalar('DGPointMamba/Val/Rebuild_Loss_L2', test_losses.avg(1), epoch)
 
         for i, metric in enumerate(test_metrics.items):
-            val_writer.add_scalar('Metric/%s' % metric, test_metrics.avg(i), epoch)
+            val_writer.add_scalar('DGPointMamba/Val/Metric/%s' % metric, test_metrics.avg(i), epoch)
 
     if source_dataset_name == 'CRNShapeNet' and target_dataset_name in ['3D_FUTURE', 'ModelNet']:
 
@@ -355,6 +430,9 @@ def validate(base_model,real_test_dataloader, epoch, ChamferDisL1, ChamferDisL2,
 def test_net(args, config):
     logger = get_logger(args.log_name)
     print_log('Tester start ... ', logger = logger)
+    experiment_logger = ExperimentLogger(args, config)
+    experiment_logger.write_run_meta(status='running')
+    experiment_logger.write_summary(status='running')
     config.dataset.test._base_.SPLIT = 'test'
     _, test_dataloader = builder.real_dataset_builder(args,config.dataset.test)
     category_metrics = dict()
@@ -373,16 +451,17 @@ def test_net(args, config):
     ChamferDisL2 = ChamferDistanceL2()
     UnidirectionalCD = UnidirectionalChamferDistance()
 
-    test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionalCD, args, config, logger=logger)
+    test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionalCD, args, config, logger=logger, experiment_logger=experiment_logger)
 
-def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionlCD ,args, config, logger = None):
+def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionlCD ,args, config, logger = None, experiment_logger=None):
 
     base_model.eval()  # set model to eval mode
 
-    test_losses = AverageMeter(['SparseLossL1', 'SparseLossL2', 'DenseLossL1', 'DenseLossL2'])
+    test_losses = AverageMeter(['Rebuild_Loss_L1', 'Rebuild_Loss_L2'])
     test_metrics = AverageMeter(Metrics.names())
     category_metrics = dict()
     n_samples = len(test_dataloader) # bs is 1
+    visualization_dir = _visualization_output_dir(args, config)
 
     with torch.no_grad():
         for idx,data in enumerate(test_dataloader):
@@ -393,28 +472,28 @@ def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionlC
                 partial = data[1].cuda()
                 gt = data[0].cuda()
 
-                rebuild_points,_, _= base_model(partial)
+                rebuild_points = _model_rebuild_points(base_model(partial))
 
                 dense_points = rebuild_points[-1]
                 if idx < 500:
-                    visualize_point_cloud_batch(dense_points, f"pred_point_{idx}")
-                    visualize_point_cloud_batch(gt, f"gt_{idx}")
-                    visualize_point_cloud_batch(partial, f"partial_{idx}")
+                    visualize_point_cloud_batch(dense_points, f"pred_point_{idx}", visualization_dir)
+                    visualize_point_cloud_batch(gt, f"gt_{idx}", visualization_dir)
+                    visualize_point_cloud_batch(partial, f"partial_{idx}", visualization_dir)
 
                 dense_loss_l1 =  ChamferDisL1(dense_points, gt)
                 dense_loss_l2 =  ChamferDisL2(dense_points, gt)
 
-                test_losses.update([dense_loss_l1.item() * 1000, dense_loss_l2.item() * 1000])
+                test_losses.update([dense_loss_l1.item() * 10000, dense_loss_l2.item() * 10000])
 
                 _metrics = Metrics.get(dense_points, gt, require_emd=True)
                 test_metrics.update(_metrics)
             elif dataset_name in ['KITTI','ScanNet','MatterPort']:
                 partial = data[0].cuda()
-                rebuild_points,_, _= base_model(partial)
+                rebuild_points = _model_rebuild_points(base_model(partial))
                 dense_points= rebuild_points[-1]
                 if idx < 200:
-                    visualize_point_cloud_batch(dense_points, f"pred_point_{idx}")
-                    visualize_point_cloud_batch(partial, f"partial_{idx}")
+                    visualize_point_cloud_batch(dense_points, f"pred_point_{idx}", visualization_dir)
+                    visualize_point_cloud_batch(partial, f"partial_{idx}", visualization_dir)
 
                 ucd_loss = UnidirectionlCD(partial, dense_points)
 
@@ -430,6 +509,8 @@ def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionlC
                             (idx + 1, n_samples,  ['%.4f' % l for l in test_losses.val()], 
                             ['%.6f' % m for m in _metrics]), logger=logger)
         if dataset_name == 'KITTI':
+            metrics_state = metric_dict(test_metrics.items, test_metrics.avg())
+            _write_test_experiment_summary(experiment_logger, args, metrics_state)
             return
         for _,v in category_metrics.items():
             test_metrics.update(v.avg())
@@ -440,21 +521,17 @@ def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, UnidirectionlC
     # Print testing results
     print_log('============================ TEST RESULTS ============================',logger=logger)
 
-    msg =''
-    for metric in test_metrics.items:
-        msg += metric + '\t'
-    print_log(msg, logger=logger)
-    msg = ''
-    msg += 'Overall \t\t'
-    for value in test_metrics.avg():
-        msg += '%.6f \t' % value
-    print_log(msg, logger=logger)
+    print_log(_format_metric_header(test_metrics.items), logger=logger)
+    print_log('Overall | ' + _format_metric_values(test_metrics.avg()), logger=logger)
+    metrics_state = metric_dict(test_metrics.items, test_metrics.avg())
+    _write_test_experiment_summary(experiment_logger, args, metrics_state)
     return 
 
-def visualize_point_cloud_batch(batch_points, name):
+def visualize_point_cloud_batch(batch_points, name, output_dir=None):
 
 
-    output_dir = "point_virtualization"
+    if output_dir is None:
+        output_dir = "point_visualization"
     os.makedirs(output_dir, exist_ok=True)
     if isinstance(batch_points, torch.Tensor):
         batch_points = batch_points.detach().cpu().double().numpy()

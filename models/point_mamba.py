@@ -13,7 +13,6 @@ from .block import Block
 from .build import MODELS
 from .utils import MLP_Res, fps_subsample
 from .SPD import SPD
-from torch.nn import MSELoss
 from .patch_group import PatchGroup
 
 try:
@@ -434,23 +433,16 @@ class MambaDecoder(nn.Module):
 @MODELS.register_module()
 class DGPointMamba(nn.Module):
     """
-    DAPointMamba主模型
-    
-    基于Mamba的点云补全模型，支持域适应（Domain Adaptation）。
-    通过空间和通道级别的状态空间模型实现源域和目标域的对齐。
-    主要包含编码器、Mamba处理层和解码器三个部分。
+    DGPointMamba single-input completion backbone.
     """
     def __init__(self, config):
         """
-        初始化DAPointMamba模型
-        
-        Args:
-            config: 配置对象，包含模型的所有超参数
+        Initialize the source-only DGPointMamba completion backbone.
         """
         super().__init__()
-        print_log(f'[DAPointMamba] ', logger='DAPointMamba')
+        print_log(f'[DGPointMamba] ', logger='DGPointMamba')
         self.config = config
-        self.trans_dim = config.mamba_config.trans_dim  # Transformer特征维度
+        self.trans_dim = config.trans_dim  # Transformer特征维度
         self.points = config.points  # 点云数量
         num_p0 = config.num_p0  # 初始点云数量
         dim_feat = config.num_p0  # 特征维度
@@ -461,8 +453,8 @@ class DGPointMamba(nn.Module):
         self.order_mode = config.order_mode  # 序列化模式
 
 
-        self.encoder_dims = config.mamba_config.encoder_dims
-        self.depth = config.mamba_config.depth
+        self.encoder_dims = config.encoder_dims
+        self.mamba_depth = config.mamba_depth
         self.encoder = Encoder(encoder_channel=self.encoder_dims)
 
         self.pos_embed = nn.Sequential(
@@ -471,11 +463,6 @@ class DGPointMamba(nn.Module):
             nn.Linear(128, self.trans_dim)
         )
 
-
-        self.blocks = MixerModel(d_model=self.trans_dim,
-                                 n_layer=self.depth,
-                                 rms_norm=self.config.rms_norm)
-                                 
         self.drop_out = nn.Dropout(config.drop_out) if "drop_out" in config else nn.Dropout(0)
 
         self.norm = nn.LayerNorm(self.trans_dim)
@@ -489,15 +476,14 @@ class DGPointMamba(nn.Module):
             nn.Linear(128, self.trans_dim)
         )
 
-        self.decoder_depth = config.mamba_config.decoder_depth
         self.MAE_decoder = MambaDecoder(
             embed_dim=self.trans_dim,
-            depth=self.decoder_depth,
+            depth=self.mamba_depth,
             config=config,
         )
 
-        print_log(f'[DAPointMamba] divide point cloud into G{self.num_group} x S{self.group_size} points ...',
-                  logger='DAPointMamba')
+        print_log(f'[DGPointMamba] divide point cloud into G{self.num_group} x S{self.group_size} points ...',
+                  logger='DGPointMamba')
 
 
         # 点云分组模块：将点云分组为patches
@@ -505,19 +491,13 @@ class DGPointMamba(nn.Module):
             group_size=self.group_size,  # 每组点数
             use_serialization=True,  # 使用序列化
             scale=15.0,  # 坐标缩放因子
-            depth=16,  # 编码深度
+            order_mode=self.order_mode,
             enable_patch_shuffle=False  # 不启用patch打乱
         )
 
         self.decoder = Decoder(dim_feat=self.trans_dim, num_pc=num_pc, num_p0=num_p0, radius=radius, 
                                bounding=bounding, up_factors=up_factors)
         
-        # SSM模块和对齐模块：用于域适应
-        D = self.trans_dim
-        self.spatial_ssm = SpatialSSM(dim=D)  # 空间对齐模块
-        self.channel_ssm = ChannelSSM(dim=D, segments=4)  # 通道对齐模块
-        self.mse = MSELoss()  # 均方误差损失，用于对齐损失
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -533,64 +513,22 @@ class DGPointMamba(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)    
 
-    def forward(self, pts_s, pts_t=None,**kwargs):
+    def forward(self, partial, **kwargs):
+        neighborhoods, centers = self.group_divider(partial)
+        group_input_tokens = self.encoder(neighborhoods)
+        pos = self.pos_embed(centers)
+        tokens = self.drop_out(group_input_tokens)
 
-        
+        out = self.MAE_decoder(tokens, pos)
+        out = self.norm(out)  # [B, G, D]
 
-        if pts_t is not None:
-            #grouped (torch.Tensor): 分组后的点云，形状为 (B, G, group_size, 3)
-            #center (torch.Tensor): 每个组的中心点坐标，形状为 (B, G, 3)
-            neighborhoods_s, centers_s, neighborhoods_t, centers_t = \
-                self.group_divider(pts_s, pts_t)
-            
-            group_input_tokens_s = self.encoder(neighborhoods_s)  # [B, G, C]即(B, G, encoder_channel)
-            group_input_tokens_t = self.encoder(neighborhoods_t)  # [B, G, C]
-            pos_s = self.pos_embed(centers_s)
-            pos_t = self.pos_embed(centers_t)
-            x_s = self.drop_out(group_input_tokens_s)
-            x_t = self.drop_out(group_input_tokens_t)
-            
-            sp_s, sp_t = self.spatial_ssm(
-                x_s.permute(0,2,1), 
-                x_t.permute(0,2,1)
-            ) 
-            
-            x_s = sp_s.permute(0,2,1)   
-            x_t = sp_t.permute(0,2,1)
-        else:
-            neighborhoods_s, centers_s = self.group_divider(pts_s)
-            group_input_tokens_s = self.encoder(neighborhoods_s)  
-            pos_s = self.pos_embed(centers_s)
-            x_s = self.drop_out(group_input_tokens_s)
-            
-            x_t = None
-            sp_s = sp_t = None
-
-        out_s = self.MAE_decoder(x_s, pos_s)
-        out_s = self.norm(out_s) #[32,64,384]
-
-        if x_t is not None:
-            out_t = self.MAE_decoder(x_t, pos_t)
-            out_t = self.norm(out_t)
-
-            ch_s, ch_t = self.channel_ssm(
-                out_s.permute(0,2,1),  # (B,D,G)
-                out_t.permute(0,2,1)
-            )
-            out_s = ch_s.permute(0,2,1)  # (B,G,D)
-            out_t = ch_t.permute(0,2,1)
-
-            loss_sp = self.mse(sp_s, sp_t)
-            loss_ch = self.mse(ch_s, ch_t)
-
-        else:
-            loss_sp = None
-            loss_ch = None
-
-        global_feat_s = torch.max(out_s, dim=1, keepdim=True)[0] 
-        global_feat = global_feat_s.transpose(1,2)
-        rebuild_points = self.decoder(global_feat, pts_s)
-        return rebuild_points, loss_sp, loss_ch
+        global_feat = torch.max(out, dim=1, keepdim=True)[0].transpose(1, 2)
+        rebuild_points = self.decoder(global_feat, partial)
+        aux = {
+            "mamba_depth": self.mamba_depth,
+            "order_mode": self.order_mode,
+        }
+        return rebuild_points, aux
     
 class Decoder(nn.Module):
     """

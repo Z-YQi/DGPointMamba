@@ -26,16 +26,16 @@
 
 ## 最小任务
 
-- [ ] 为每个实验记录 `experiment_name`、`commit_hash`、`config_path`、`seed`、`source_dataset`、`target_dataset`、`category`、`output_dir`、`checkpoint_path`。
-- [ ] 训练阶段写入 step 或 epoch 级 `metrics.jsonl`。
-- [ ] 每次验证或测试后更新 one-row-per-experiment 的 `summary.csv`。
-- [ ] 记录基础 loss：`loss_total`、`loss_rec_clean`、`loss_rec_aug_src`。
+- [x] 为每个实验记录 `experiment_name`、`commit_hash`、`config_path`、`seed`、`source_dataset`、`target_dataset`、`category`、`output_dir`、`checkpoint_path`。
+- [x] 训练阶段写入 step 或 epoch 级 `metrics.jsonl`。
+- [x] 每次验证或测试后更新 one-row-per-experiment 的 `summary.csv`。
+- [x] 记录基础 loss：`loss_total`、`loss_rec_clean`、`loss_rec_aug_src`。
 - [ ] 当模块开启时记录对应 loss：`loss_tpdr`、`loss_tpdr_disp`、`loss_tpdr_graph`、`loss_tpdr_homeo`、`loss_offset`。
 - [ ] 当 generator 或 DGDeformableScan 开启时记录统计量：`mean_abs_A`、`mean_abs_w`、`mean_abs_Aw`、`mean_Aw_violation`、`mean_delta_p`、`mean_delta_t`、`token_interchange_ratio`、`domain_code_norm`。
-- [ ] 记录 evaluation metrics，顺序固定为 `F-Score | CDL1 | CDL2 | EMDistance | UCD | UHD`。
-- [ ] 保证 TensorBoard tag 与 `metrics.jsonl` 字段名尽量一致。
-- [ ] 新增一个轻量日志分析脚本，能读取多个实验输出目录并生成对比表。
-- [ ] 新增一个 loss 趋势分析入口，至少能比较 `loss_total`、`loss_rec_clean`、`loss_rec_aug_src` 和主 metric。
+- [x] 记录 evaluation metrics，顺序固定为 `F-Score | CDL1 | CDL2 | EMDistance | UCD | UHD`。
+- [x] 保证 TensorBoard tag 与 `metrics.jsonl` 字段名尽量一致。
+- [x] 新增一个轻量日志分析脚本，能读取多个实验输出目录并生成对比表。
+- [x] 新增一个 loss 趋势分析入口，至少能比较 `loss_total`、`loss_rec_clean`、`loss_rec_aug_src` 和主 metric。
 - [ ] 为失败实验记录 `status: failed`、失败阶段、错误摘要和最后可用 step。
 
 ## 推荐输出文件
@@ -92,10 +92,10 @@ experiment_name,commit_hash,config_path,seed,source_dataset,target_dataset,categ
 
 ## 完成标准
 
-- [ ] 每个正式实验都能生成 `run_meta.json`、`metrics.jsonl` 和 `summary.csv`。
-- [ ] Fixed SinPoint baseline 至少能记录 clean/aug reconstruction loss 和 3D-FUTURE CDL2。
-- [ ] 多个实验可以按 `summary.csv` 横向比较。
-- [ ] 实验分析 agent 能根据日志判断 loss 趋势和主要异常来源。
+- [x] 每个正式实验都能生成 `run_meta.json`、`metrics.jsonl` 和 `summary.csv`。
+- [x] Fixed SinPoint baseline 至少能记录 clean/aug reconstruction loss 和 3D-FUTURE CDL2。
+- [x] 多个实验可以按 `summary.csv` 横向比较。
+- [x] 实验分析 agent 能根据日志判断 loss 趋势和主要异常来源。
 - [ ] 失败实验不会只留下散乱终端输出，而是能被后续复盘。
 
 ## 给实验分析 agent 的提示词模板
@@ -111,4 +111,3 @@ experiment_name,commit_hash,config_path,seed,source_dataset,target_dataset,categ
 4. 最可能影响结果的模块或超参数
 5. 下一步只改一个变量时应该改什么
 ```
-

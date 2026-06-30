@@ -10,8 +10,9 @@ class PatchGroup(torch.nn.Module):
     每个补丁包含固定数量的点。主要用于将点云转换为适合Transformer处理的序列格式。
     """
 
-    def __init__(self, group_size, use_serialization=True, scale=10.0, depth=16,
-                 enable_patch_shuffle=False):
+    def __init__(self, group_size, use_serialization=True, scale=10.0,
+                 serialization_depth=16, order_mode="z", enable_patch_shuffle=False,
+                 depth=None):
         """
         初始化补丁分组模块
         
@@ -28,11 +29,15 @@ class PatchGroup(torch.nn.Module):
                                                     默认为False
         """
         super().__init__()
+        if depth is not None:
+            serialization_depth = depth
+        if order_mode != "z":
+            raise ValueError(f"PatchGroup currently supports only order_mode='z', got {order_mode!r}")
         self.group_size = group_size
         self.use_serialization = use_serialization
         self.scale = scale
-        self.depth = depth
-        self.z_order = ["z", "z-trans"]  # Z-order编码方式列表
+        self.depth = serialization_depth
+        self.order_mode = order_mode
         self.enable_patch_shuffle = enable_patch_shuffle
 
     def forward(self, xyz_s, xyz_t=None):
@@ -63,7 +68,7 @@ class PatchGroup(torch.nn.Module):
         else:
             # 使用统一的坐标最小值，确保源和目标点云使用相同的编码基准
             unified_min = torch.min(xyz_s.amin(dim=1, keepdim=True), xyz_t.amin(dim=1, keepdim=True))
-            order = self.z_order[0]  # 使用Z-order编码
+            order = self.order_mode  # 使用Z-order编码
             grouped_s, center_s = self._serialize_and_group(xyz_s, order, coord_min=unified_min)
             grouped_t, center_t = self._serialize_and_group(xyz_t, order, coord_min=unified_min)
             return grouped_s, center_s, grouped_t, center_t
@@ -123,7 +128,9 @@ class PatchGroup(torch.nn.Module):
         code_all = []
         for b in range(B):#把(B*N,3)分成B个(N,3)
             grid_b = grid_coord[b * N : (b + 1) * N]
-            use_order = order if order is not None else self.z_order[0]
+            use_order = order if order is not None else self.order_mode
+            if use_order != "z":
+                raise ValueError(f"PatchGroup currently supports only order_mode='z', got {use_order!r}")
             # 使用Z-order或Hilbert曲线编码，生成每个点的编码值
             code_b = ptv3_encode(grid_b, batch=None, depth=self.depth, order=use_order)#传一个批次进来(N,3)
             #code_b 形状：(N,) 含义：一个批次中 N 个点的 Z-order 编码值
@@ -175,7 +182,6 @@ class PatchGroup(torch.nn.Module):
         # 计算每个组的中心点
         center = grouped.mean(dim=2)
         return grouped, center
-
 
 
 

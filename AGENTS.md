@@ -33,10 +33,12 @@ Responsibilities:
 - Decide the next module to implement.
 - Review diffs from module-development sessions.
 - Check whether a change matches the task file and detailed design.
+- Before approving push, remote smoke test, or formal experiment, verify that all prerequisite tasks in `doc/tasks/progress.md` are complete or explicitly waived.
 - Analyze experiment logs and decide follow-up experiments.
 - Keep the implementation path conservative and staged.
 
 The main agent should not approve a new module until the previous module has a usable checkpoint or a clearly documented failure.
+The main agent must not approve an experiment run when an earlier prerequisite task in the planned order is still incomplete, unless the waiver is written down with a concrete reason and risk.
 
 ### Module Development Agent
 
@@ -46,6 +48,7 @@ Responsibilities:
 
 - Read the required documents.
 - Inspect the current code before editing.
+- Before implementation, perform a call-path audit covering training data flow, loss data flow, and model forward return values.
 - Implement only the requested task.
 - Avoid unrelated refactors.
 - Run lightweight local checks when full training is unavailable.
@@ -57,6 +60,8 @@ Rules:
 - Do not change experiment semantics outside the current task.
 - Do not silently change metric order, loss definitions, or dataset splits.
 - Do not introduce target-domain training loss or source-target alignment loss.
+- If the design document and existing helper function semantics disagree, stop and report the mismatch instead of guessing.
+- Every completed checklist item must be supported by file and line-number evidence in the final summary.
 
 ### Experiment Analysis Agent
 
@@ -308,6 +313,7 @@ Do not stack multiple unverified fixes in one change.
 
 The main agent should review every module diff for:
 
+- Whether all prerequisite task files earlier in `doc/tasks/progress.md` are complete or explicitly waived.
 - Whether it matches the assigned task file.
 - Whether it changes files outside the expected scope.
 - Whether it preserves tensor shapes.
@@ -325,8 +331,10 @@ Use this template when starting a new module-development conversation:
 ```text
 请先阅读 AGENTS.md、doc/proposal.md、doc/detailed-design.md 和 doc/tasks/<TASK>.md。
 只完成 doc/tasks/<TASK>.md 中的任务，不要提前实现后续模块。
+实现前先做 call-path audit，列出训练数据流、loss 数据流、model forward 返回值。
+如果发现设计文档和现有工具函数语义不一致，先停下来说明，不要自行假设。
 修改前先检查当前代码结构；修改后运行可用的轻量检查。
-最后总结：改了哪些文件、满足了哪些验收标准、哪些检查已运行、还有哪些风险。
+最后总结：改了哪些文件、满足了哪些验收标准、每个 checklist 项的文件和行号证据、哪些检查已运行、还有哪些风险。
 ```
 
 ## Prompt Template For Review
@@ -335,10 +343,11 @@ Use this template when asking the main agent to review:
 
 ```text
 请作为 reviewer 审查当前修改，重点检查：
-1. 是否符合 doc/tasks/<TASK>.md
-2. 是否破坏 Fixed SinPoint baseline 或已有稳定路径
-3. tensor shape 是否一致
-4. loss、metric、日志字段是否正确
-5. 是否引入目标域训练、source-target alignment 或提前实现后续模块
-6. 还需要哪些 smoke test 或远程实验
+1. 按 doc/tasks/progress.md 顺序，前置任务是否已完成；如未完成，是否有明确豁免理由
+2. 是否符合 doc/tasks/<TASK>.md
+3. 是否破坏 Fixed SinPoint baseline 或已有稳定路径
+4. tensor shape 是否一致
+5. loss、metric、日志字段是否正确
+6. 是否引入目标域训练、source-target alignment 或提前实现后续模块
+7. 还需要哪些 smoke test 或远程实验
 ```

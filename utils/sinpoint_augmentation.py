@@ -49,10 +49,12 @@ class SinPoint:
         B, N, C = data.shape
         if self.sample == "RPS":
             # Random Point Sampling: B * k
-            idxs = self.generate_random_permutations_batch(B, N, self.rand_center_num)
-        if self.sample == "FPS":
+            idxs = self.generate_random_permutations_batch(B, N, self.rand_center_num, device=device)
+        elif self.sample == "FPS":
             # Farthest Point Sampling: B * k
             idxs = self.farthest_point_sample(data, self.rand_center_num)
+        else:
+            raise ValueError(f"Unsupported SinPoint sampling method: {self.sample}")
         dist = torch.zeros_like(data).to(device)
         for i in range(self.rand_center_num):
             center = self.index_points(data, idxs[:, i]).unsqueeze(1)
@@ -113,7 +115,7 @@ class SinPoint:
             newdata = torch.cat([data, newdata], dim=0)
             label = torch.cat([label, label], dim=0)
             if self.shuffle:
-                idxs = torch.randperm(B * 2)
+                idxs = torch.randperm(B * 2, device=data.device)
                 newdata = newdata[idxs, :, :]
                 label = label[idxs, :]
         return newdata, label.squeeze(1)
@@ -164,7 +166,7 @@ class SinPoint:
             farthest = torch.max(distance, -1)[1]
         return centroids
 
-    def generate_random_permutations_batch(self, B, N, npoint):
+    def generate_random_permutations_batch(self, B, N, npoint, device=None):
         """
         Generate random permutations for batch sampling.
         
@@ -176,7 +178,7 @@ class SinPoint:
         Returns:
             torch.Tensor: Sampled point indices, shape [B, npoint]
         """
-        all_permutations = torch.stack([torch.randperm(N) for _ in range(B)])
+        all_permutations = torch.stack([torch.randperm(N, device=device) for _ in range(B)])
         centroids = all_permutations[:, :npoint]
         return centroids
 

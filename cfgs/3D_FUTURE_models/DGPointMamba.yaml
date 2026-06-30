@@ -14,18 +14,18 @@ scheduler: {
 
 
 dataset : {
-  train : { _base_: cfgs/dataset_configs/ModelNet.yaml, 
+  train : { _base_: cfgs/dataset_configs/3D_Future.yaml,
             others: {subset: 'train'},
             virtual_dataset: CRN,
-            real_dataset: ModelNet},
-  val : { _base_: cfgs/dataset_configs/ModelNet.yaml, 
+            real_dataset: 3D_FUTURE},
+  val : { _base_: cfgs/dataset_configs/3D_Future.yaml,
             others: {subset: 'test'},
             virtual_dataset: CRN,
-            real_dataset: ModelNet},
-  test : { _base_: cfgs/dataset_configs/ModelNet.yaml, 
+            real_dataset: 3D_FUTURE},
+  test : { _base_: cfgs/dataset_configs/3D_Future.yaml,
             others: {subset: 'test'},
             virtual_dataset: CRN,
-            real_dataset: ModelNet}}
+            real_dataset: 3D_FUTURE}}
 
 model : {
   NAME: DGPointMamba,

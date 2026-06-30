@@ -49,7 +49,7 @@ class Completionloss:
 
         return d
 
-    def get_loss(self, pcds_pred, partial, gt):
+    def get_loss(self, pcds_pred, partial, gt, include_partial_matching=True):
         Pc, P1, P2, P3 = pcds_pred
         gt_2 = fps_subsample(gt, P2.shape[1])
         gt_1 = fps_subsample(gt_2, P1.shape[1])
@@ -60,7 +60,10 @@ class Completionloss:
         loss_2 = self.metric(P2, gt_2)
         loss_3 = self.metric(P3, gt)
 
-        partial_matching = torch.tensor(0).cuda() if self.loss_func == 'emd' else self.partial_matching(partial, P3)
+        if include_partial_matching:
+            partial_matching = torch.tensor(0, device=P3.device, dtype=P3.dtype) if self.loss_func == 'emd' else self.partial_matching(partial, P3)
+        else:
+            partial_matching = P3.new_zeros(())
 
         loss_all = loss_c + loss_1 + loss_2 + loss_3 + partial_matching
         losses = [partial_matching, loss_c, loss_1, loss_2, loss_3]
